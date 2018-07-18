@@ -21,7 +21,6 @@
 #import <MobileCoreServices/MobileCoreServices.h>
 #import <AVFoundation/AVFoundation.h>
 #import <objc/message.h>
-#import <objc/runtime.h>
 
 #import "CDVWKWebViewEngine.h"
 #import "CDVWKWebViewUIDelegate.h"
@@ -103,9 +102,15 @@
 @property (nonatomic, strong) GCDWebServer *webServer;
 @property (nonatomic, readwrite) CGRect frame;
 @property (nonatomic, readwrite) NSString *CDV_LOCAL_SERVER;
+
 @end
 
+// expose private configuration value required for background operation
+@interface WKWebViewConfiguration ()
 
+@property (setter=_setAlwaysRunsAtForegroundPriority:, nonatomic) bool _alwaysRunsAtForegroundPriority;
+
+@end
 
 // see forwardingTargetForSelector: selector comment for the reason for this pragma
 #pragma clang diagnostic ignored "-Wprotocol"
@@ -135,22 +140,34 @@
     }
     return self;
 }
+
 - (void)initWebServer:(NSDictionary*)settings
 {
-        [GCDWebServer setLogLevel: kGCDWebServerLoggingLevel_Warning];
-        self.webServer = [[GCDWebServer alloc] init];
-        [self.webServer addGETHandlerForBasePath:@"/" directoryPath:@"/" indexFilename:nil cacheAge:3600 allowRangeRequests:YES];
+    [GCDWebServer setLogLevel: kGCDWebServerLoggingLevel_Warning];
+    self.webServer = [[GCDWebServer alloc] init];
+    [self.webServer addGETHandlerForBasePath:@"/" directoryPath:@"/" indexFilename:nil cacheAge:3600 allowRangeRequests:YES];
+    
+    BOOL suspendInBackground = YES;
+    int waitTime = 10;
     int portNumber = [settings cordovaFloatSettingForKey:@"WKPort" defaultValue:8080];
     if(portNumber != 8080){
         self.CDV_LOCAL_SERVER = [NSString stringWithFormat:@"http://localhost:%d", portNumber];
     }
-        NSDictionary *options = @{
-                                  GCDWebServerOption_Port: @(portNumber),
-                                  GCDWebServerOption_BindToLocalhost: @(YES),
-                                  GCDWebServerOption_ServerName: @"Ionic"
-                                  };
     
-        [self.webServer startWithOptions:options error:nil];
+    if ([settings cordovaBoolSettingForKey:@"WKEnableBackground" defaultValue:NO]) {
+        suspendInBackground = NO;
+        waitTime = 60;
+    }
+    
+    NSDictionary *options = @{
+                              GCDWebServerOption_AutomaticallySuspendInBackground: @(suspendInBackground),
+                              GCDWebServerOption_ConnectedStateCoalescingInterval: @(waitTime),
+                              GCDWebServerOption_Port: @(portNumber),
+                              GCDWebServerOption_BindToLocalhost: @(YES),
+                              GCDWebServerOption_ServerName: @"Ionic"
+                              };
+    
+    [self.webServer startWithOptions:options error:nil];
 }
 
 - (WKWebViewConfiguration*) createConfigurationFromSettings:(NSDictionary*)settings
@@ -170,6 +187,8 @@
     if (settings == nil) {
         return configuration;
     }
+    //required to stop wkwebview suspending in background too eagerly (as used in background mode plugin)
+    configuration._alwaysRunsAtForegroundPriority = [settings cordovaBoolSettingForKey:@"WKEnableBackground" defaultValue:NO];
     configuration.allowsInlineMediaPlayback = [settings cordovaBoolSettingForKey:@"AllowInlineMediaPlayback" defaultValue:YES];
     configuration.suppressesIncrementalRendering = [settings cordovaBoolSettingForKey:@"SuppressesIncrementalRendering" defaultValue:NO];
     configuration.allowsAirPlayForMediaPlayback = [settings cordovaBoolSettingForKey:@"MediaPlaybackAllowsAirPlay" defaultValue:YES];
@@ -225,6 +244,9 @@
     // remove from keyWindow before recreating
     [self.engineWebView removeFromSuperview];
     WKWebView* wkWebView = [[WKWebView alloc] initWithFrame:self.frame configuration:configuration];
+    // PR #111 re window sizing
+    //CGRect fullframe = [[UIScreen mainScreen] bounds];
+    //WKWebView* wkWebView = [[WKWebView alloc] initWithFrame:fullframe configuration:configuration];
 
     #if __IPHONE_OS_VERSION_MAX_ALLOWED >= 110000
     if (@available(iOS 11.0, *)) {
@@ -234,6 +256,7 @@
 
     wkWebView.UIDelegate = self.uiDelegate;
     self.engineWebView = wkWebView;
+
     // add to keyWindow to ensure it is 'active'
     [UIApplication.sharedApplication.keyWindow addSubview:self.engineWebView];
 
@@ -255,9 +278,13 @@
         [wkWebView.configuration.userContentController addScriptMessageHandler:(id < WKScriptMessageHandler >)self.viewController name:CDV_BRIDGE_NAME];
     }
 
-    //if (![settings cordovaBoolSettingForKey:@"KeyboardDisplayRequiresUserAction" defaultValue:NO]) {
-    [self keyboardDisplayDoesNotRequireUserAction];
-    //}
+    if (![settings cordovaBoolSettingForKey:@"KeyboardDisplayRequiresUserAction" defaultValue:YES]) {
+        [self keyboardDisplayDoesNotRequireUserAction];
+    }
+
+    if ([settings cordovaBoolSettingForKey:@"KeyboardAppearanceDark" defaultValue:NO] == YES) {
+        [self setKeyboardAppearanceDark];
+    }
 
     [self updateSettings:settings];
 
@@ -274,26 +301,31 @@
 }
 
 // https://github.com/Telerik-Verified-Plugins/WKWebView/commit/04e8296adeb61f289f9c698045c19b62d080c7e3#L609-L620
-- (void) keyboardDisplayDoesNotRequireUserAction {
-    Class class = NSClassFromString(@"WKContentView");
-    NSOperatingSystemVersion iOS_11_3_0 = (NSOperatingSystemVersion){11, 3, 0};
+- (void)keyboardDisplayDoesNotRequireUserAction
+{
+    SEL sel = sel_getUid("_startAssistingNode:userIsInteracting:blurPreviousNode:userObject:");
+  	Class WKContentView = NSClassFromString(@"WKContentView");
+  	Method method = class_getInstanceMethod(WKContentView, sel);
+  	IMP originalImp = method_getImplementation(method);
+  	IMP imp = imp_implementationWithBlock(^void(id me, void* arg0, BOOL arg1, BOOL arg2, id arg3) {
+    		((void (*)(id, SEL, void*, BOOL, BOOL, id))originalImp)(me, sel, arg0, TRUE, arg2, arg3);
+  	});
+  	method_setImplementation(method, imp);
+}
 
-    if ([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion: iOS_11_3_0]) {
-        SEL selector = sel_getUid("_startAssistingNode:userIsInteracting:blurPreviousNode:changingActivityState:userObject:");
-        Method method = class_getInstanceMethod(class, selector);
-        IMP original = method_getImplementation(method);
-        IMP override = imp_implementationWithBlock(^void(id me, void* arg0, BOOL arg1, BOOL arg2, BOOL arg3, id arg4) {
-            ((void (*)(id, SEL, void*, BOOL, BOOL, BOOL, id))original)(me, selector, arg0, TRUE, arg2, arg3, arg4);
-        });
-        method_setImplementation(method, override);
-    } else {
-        SEL selector = sel_getUid("_startAssistingNode:userIsInteracting:blurPreviousNode:userObject:");
-        Method method = class_getInstanceMethod(class, selector);
-        IMP original = method_getImplementation(method);
-        IMP override = imp_implementationWithBlock(^void(id me, void* arg0, BOOL arg1, BOOL arg2, id arg3) {
-            ((void (*)(id, SEL, void*, BOOL, BOOL, id))original)(me, selector, arg0, TRUE, arg2, arg3);
-        });
-        method_setImplementation(method, override);
+- (void)setKeyboardAppearanceDark
+{
+    IMP darkImp = imp_implementationWithBlock(^(id _s) {
+        return UIKeyboardAppearanceDark;
+    });
+    for (NSString* classString in @[@"WKContentView", @"UITextInputTraits"]) {
+        Class c = NSClassFromString(classString);
+        Method m = class_getInstanceMethod(c, @selector(keyboardAppearance));
+        if (m != NULL) {
+            method_setImplementation(m, darkImp);
+        } else {
+            class_addMethod(c, @selector(keyboardAppearance), darkImp, "l@:");
+        }
     }
 }
 
@@ -716,4 +748,3 @@ static void * KVOContext = &KVOContext;
 }
 
 @end
-
